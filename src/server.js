@@ -1,4 +1,8 @@
 // server.js - Node.js API Service for Dashboard Data
+
+// IMPORTANT: Load environment variables first!
+require('dotenv').config();
+
 const express = require('express');
 const mysql = require('mysql2/promise');
 const cors = require('cors');
@@ -11,7 +15,7 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// Database configuration
+// Database configuration - now will properly read from .env file
 const dbConfig = {
   host: process.env.DB_HOST || 'your-default-host',
   user: process.env.DB_USER || 'dbmasteruser',
@@ -21,6 +25,14 @@ const dbConfig = {
   charset: 'utf8mb4'
 };
 
+// Debug: Log database config (remove password for security)
+console.log('🔧 Database Config:', {
+  host: dbConfig.host,
+  user: dbConfig.user,
+  database: dbConfig.database,
+  port: dbConfig.port
+});
+
 // Create database connection pool
 const pool = mysql.createPool({
   ...dbConfig,
@@ -28,6 +40,18 @@ const pool = mysql.createPool({
   connectionLimit: 10,
   queueLimit: 0
 });
+
+// Test database connection on startup
+async function testDatabaseConnection() {
+  try {
+    const connection = await pool.getConnection();
+    console.log('✅ Database connected successfully');
+    connection.release();
+  } catch (error) {
+    console.error('❌ Database connection failed:', error.message);
+    process.exit(1);
+  }
+}
 
 // Utility function to convert database rows to dashboard format
 const convertToDashboardFormat = (rows) => {
@@ -416,17 +440,28 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 API Server running on port ${PORT}`);
-  console.log(`📊 Dashboard API endpoints:`);
-  console.log(`   GET /api/health - Health check`);
-  console.log(`   GET /api/loan-data - Get loan data with filters`);
-  console.log(`   GET /api/loan-data/:loanType - Get specific loan type data`);
-  console.log(`   GET /api/loan-data/summary - Get aggregated summary`);
-  console.log(`   GET /api/npl-data - Get NPL data`);
-  console.log(`   GET /api/status - Get data processing status`);
-});
+// Initialize server
+async function startServer() {
+  try {
+    // Test database connection first
+    await testDatabaseConnection();
+    
+    // Start server
+    app.listen(PORT, () => {
+      console.log(`🚀 API Server running on port ${PORT}`);
+      console.log(`📊 Dashboard API endpoints:`);
+      console.log(`   GET /api/health - Health check`);
+      console.log(`   GET /api/loan-data - Get loan data with filters`);
+      console.log(`   GET /api/loan-data/:loanType - Get specific loan type data`);
+      console.log(`   GET /api/loan-data/summary - Get aggregated summary`);
+      console.log(`   GET /api/npl-data - Get NPL data`);
+      console.log(`   GET /api/status - Get data processing status`);
+    });
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
+}
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
@@ -434,5 +469,8 @@ process.on('SIGTERM', async () => {
   await pool.end();
   process.exit(0);
 });
+
+// Start the server
+startServer();
 
 module.exports = app;
