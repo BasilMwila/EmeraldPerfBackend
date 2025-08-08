@@ -57,12 +57,11 @@ async function testDatabaseConnection() {
 // Utility function to convert database rows to dashboard format
 const convertToDashboardFormat = (rows) => {
   return rows.map(row => {
-    // Calculate derived fields
-    const grossRecovered = (parseFloat(row.principal_recovered) || 0) + (parseFloat(row.sfee_recovered) || 0);
-    const principalLent = (parseFloat(row.gross_lent) || 0) - (parseFloat(row.sfee_lent) || 0);
+    // Based on sample data, use actual field names and values
+    // Don't calculate gross_recovered - use individual recovery fields
     
     return {
-      // Date field (load_date -> date)
+      // Date field (use load_date)
       date: moment(row.load_date).format('YYYY-MM-DD'),
       
       // Basic info
@@ -78,12 +77,12 @@ const convertToDashboardFormat = (rows) => {
       overall_actives_mtd: parseInt(row.overall_actives_mtd) || 0,
       overall_actives_ytd: parseInt(row.overall_actives_ytd) || 0,
       
-      // Lending metrics
-      lending_transactions: parseInt(row.lending_txns) || 0,
-      lending_txns: parseInt(row.lending_txns) || 0,
-      gross_lent: parseFloat(row.gross_lent) || 0,
-      principal_lent: principalLent,
-      service_fee_lent: parseFloat(row.sfee_lent) || 0,
+      // Lending metrics - use correct field mapping based on Aug 6 data
+      lending_transactions: parseFloat(row.lending_txns) || 0, // Note: this might be decimal in sample data
+      lending_txns: parseFloat(row.lending_txns) || 0,
+      gross_lent: parseFloat(row.gross_lent) || 0, // Total amount including fees (288,920.22)
+      principal_lent: (parseFloat(row.gross_lent) || 0) - (parseFloat(row.sfee_lent) || 0), // Calculate as gross - sfee
+      service_fee_lent: parseFloat(row.sfee_lent) || 0, // Service fees (47,019.22)
       sfee_lent: parseFloat(row.sfee_lent) || 0,
       
       // Fees charged
@@ -92,10 +91,9 @@ const convertToDashboardFormat = (rows) => {
       interest_fees_charged: parseFloat(row.interest_fees_charged) || 0,
       daily_fees_charged: parseFloat(row.daily_fees_charged) || 0,
       
-      // Recovery metrics
-      recovery_transactions: parseInt(row.recovery_txns) || 0,
-      recovery_txns: parseInt(row.recovery_txns) || 0,
-      gross_recovered: grossRecovered,
+      // Recovery metrics - use raw values, don't calculate gross_recovered
+      recovery_transactions: parseFloat(row.recovery_txns) || 0,
+      recovery_txns: parseFloat(row.recovery_txns) || 0,
       principal_recovered: parseFloat(row.principal_recovered) || 0,
       service_fee_recovered: parseFloat(row.sfee_recovered) || 0,
       sfee_recovered: parseFloat(row.sfee_recovered) || 0,
@@ -106,13 +104,21 @@ const convertToDashboardFormat = (rows) => {
       interest_fees_recovered: parseFloat(row.interest_fees_recovered) || 0,
       daily_fees_recovered: parseFloat(row.daily_fees_recovered) || 0,
       
+      // Calculate gross_recovered as sum of individual recovery components
+      gross_recovered: (parseFloat(row.principal_recovered) || 0) + 
+                      (parseFloat(row.sfee_recovered) || 0) + 
+                      (parseFloat(row.late_fees_recovered) || 0) + 
+                      (parseFloat(row.setup_fees_recovered) || 0) + 
+                      (parseFloat(row.interest_fees_recovered) || 0) + 
+                      (parseFloat(row.daily_fees_recovered) || 0),
+      
       // Additional fields for compatibility
       unique_users: parseInt(row.overall_actives_daily) || 0,
       overall_unique_users: parseInt(row.overall_actives_ytd) || 0,
       fx_rate: 1.0,
       
       // Metadata
-      processed_at: moment(row.processed_at).format('YYYY-MM-DD HH:mm:ss'),
+      processed_at: row.processed_at ? moment(row.processed_at).format('YYYY-MM-DD HH:mm:ss') : '',
       file_source: row.file_source || ''
     };
   });
@@ -133,17 +139,21 @@ app.get('/api/loan-data', async (req, res) => {
     const {
       loan_type,
       telco = 'both',
-      days = '30',
+      days = '7', // Reduce default to 7 days for better performance
       start_date,
-      end_date
+      end_date,
+      limit = '1000' // Add limit parameter for pagination
     } = req.query;
 
-    // Determine which tables to query
+    // Determine which tables to query - be more strict about telco filtering
     const tables = [];
-    if (telco.toLowerCase() === 'airtel' || telco.toLowerCase() === 'both') {
+    if (telco.toLowerCase() === 'airtel') {
       tables.push('airtel_loan_data');
-    }
-    if (telco.toLowerCase() === 'mtn' || telco.toLowerCase() === 'both') {
+      console.log('🔍 Filtering to AIRTEL ONLY for accurate comparison');
+    } else if (telco.toLowerCase() === 'mtn') {
+      tables.push('MTN_loan_data');
+    } else if (telco.toLowerCase() === 'both') {
+      tables.push('airtel_loan_data');
       tables.push('MTN_loan_data');
     }
 
@@ -155,19 +165,28 @@ app.get('/api/loan-data', async (req, res) => {
     const whereConditions = [];
     const params = [];
 
-    // Date filtering
+    // Date filtering - use load_date
     if (start_date && end_date) {
       whereConditions.push('load_date BETWEEN ? AND ?');
       params.push(start_date, end_date);
     } else {
+      const daysInt = parseInt(days) || 7;
       whereConditions.push('load_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)');
-      params.push(parseInt(days));
+      params.push(daysInt);
     }
 
     // Loan type filtering
     if (loan_type) {
       whereConditions.push('loan_type LIKE ?');
       params.push(`%${loan_type}%`);
+    }
+    
+    // Additional telco filtering in SQL for extra safety
+    if (telco.toLowerCase() === 'airtel') {
+      whereConditions.push("(telco = 'Airtel' OR telco = 'airtel')");
+      console.log('🔍 Adding SQL filter for Airtel telco only');
+    } else if (telco.toLowerCase() === 'mtn') {
+      whereConditions.push("(telco = 'MTN' OR telco = 'mtn')");
     }
 
     const whereClause = whereConditions.length > 0 ? whereConditions.join(' AND ') : '1=1';
@@ -185,12 +204,25 @@ app.get('/api/loan-data', async (req, res) => {
           daily_fees_charged, daily_fees_recovered, country, telco,
           qualified_base, overall_actives_daily, overall_actives_wtd,
           overall_actives_mtd, overall_actives_ytd, processed_at, file_source
-        FROM ${table}
+        FROM ${table} t1
         WHERE ${whereClause}
+        AND t1.processed_at = (
+          SELECT MAX(t2.processed_at) 
+          FROM ${table} t2 
+          WHERE t2.load_date = t1.load_date 
+          AND t2.loan_type = t1.loan_type 
+          AND t2.denom = t1.denom
+        )
         ORDER BY load_date DESC, loan_type
+        LIMIT ?
       `;
 
-      const [rows] = await pool.execute(query, params);
+      const queryParams = [...params, parseInt(limit)];
+      console.log('🔍 SQL Query:', query.replace(/\s+/g, ' ').trim());
+      console.log('🔍 Query Params:', queryParams);
+      console.log('🔍 Parameter types:', queryParams.map(p => typeof p));
+      console.log('🔍 Parameter values:', queryParams.map(p => JSON.stringify(p)));
+      const [rows] = await pool.query(query, queryParams);
       const formattedData = convertToDashboardFormat(rows);
       allResults = allResults.concat(formattedData);
     }
@@ -220,7 +252,13 @@ app.get('/api/loan-data', async (req, res) => {
 app.get('/api/loan-data/:loanType', async (req, res) => {
   try {
     const { loanType } = req.params;
-    const { telco = 'both', days = '30' } = req.query;
+    const { 
+      telco = 'both', 
+      days = '7', // Reduce default for better performance
+      start_date, 
+      end_date,
+      limit = '500' // Add limit for specific loan types
+    } = req.query;
 
     // Map loan type to database format
     const loanTypeMap = {
@@ -235,16 +273,42 @@ app.get('/api/loan-data/:loanType', async (req, res) => {
       return res.status(400).json({ error: 'Invalid loan type' });
     }
 
-    // Determine tables to query
+    // Determine tables to query - be strict about telco filtering
     const tables = [];
-    if (telco.toLowerCase() === 'airtel' || telco.toLowerCase() === 'both') {
+    if (telco.toLowerCase() === 'airtel') {
       tables.push('airtel_loan_data');
-    }
-    if (telco.toLowerCase() === 'mtn' || telco.toLowerCase() === 'both') {
+      console.log('🔍 Specific loan type - filtering to AIRTEL ONLY');
+    } else if (telco.toLowerCase() === 'mtn') {
+      tables.push('MTN_loan_data');
+    } else if (telco.toLowerCase() === 'both') {
+      tables.push('airtel_loan_data');
       tables.push('MTN_loan_data');
     }
 
     let allResults = [];
+
+    // Build WHERE conditions for date filtering
+    const whereConditions = ['loan_type LIKE ?'];
+    let params = [`%${dbLoanType}%`];
+
+    // Date filtering - use load_date
+    if (start_date && end_date) {
+      whereConditions.push('load_date BETWEEN ? AND ?');
+      params.push(start_date, end_date);
+    } else {
+      const daysInt = parseInt(days) || 7;
+      whereConditions.push('load_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)');
+      params.push(daysInt);
+    }
+
+    // Additional telco filtering for specific loan type endpoint
+    if (telco.toLowerCase() === 'airtel') {
+      whereConditions.push("(telco = 'Airtel' OR telco = 'airtel')");
+    } else if (telco.toLowerCase() === 'mtn') {
+      whereConditions.push("(telco = 'MTN' OR telco = 'mtn')");
+    }
+    
+    const whereClause = whereConditions.join(' AND ');
 
     for (const table of tables) {
       const query = `
@@ -256,13 +320,25 @@ app.get('/api/loan-data/:loanType', async (req, res) => {
           daily_fees_charged, daily_fees_recovered, country, telco,
           qualified_base, overall_actives_daily, overall_actives_wtd,
           overall_actives_mtd, overall_actives_ytd, processed_at, file_source
-        FROM ${table}
-        WHERE loan_type LIKE ? 
-          AND load_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+        FROM ${table} t1
+        WHERE ${whereClause}
+        AND t1.processed_at = (
+          SELECT MAX(t2.processed_at) 
+          FROM ${table} t2 
+          WHERE t2.load_date = t1.load_date 
+          AND t2.loan_type = t1.loan_type 
+          AND t2.denom = t1.denom
+        )
         ORDER BY load_date DESC
+        LIMIT ?
       `;
 
-      const [rows] = await pool.execute(query, [`%${dbLoanType}%`, parseInt(days)]);
+      const queryParams = [...params, parseInt(limit)];
+      console.log('🔍 SQL Query:', query.replace(/\s+/g, ' ').trim());
+      console.log('🔍 Query Params:', queryParams);
+      console.log('🔍 Parameter types:', queryParams.map(p => typeof p));
+      console.log('🔍 Parameter values:', queryParams.map(p => JSON.stringify(p)));
+      const [rows] = await pool.query(query, queryParams);
       const formattedData = convertToDashboardFormat(rows);
       allResults = allResults.concat(formattedData);
     }
@@ -273,7 +349,14 @@ app.get('/api/loan-data/:loanType', async (req, res) => {
     res.json({
       data: allResults,
       loan_type: dbLoanType,
-      count: allResults.length
+      count: allResults.length,
+      filters: {
+        loan_type: dbLoanType,
+        telco,
+        days: parseInt(days),
+        start_date,
+        end_date
+      }
     });
 
   } catch (error) {
@@ -317,7 +400,7 @@ app.get('/api/loan-data/summary', async (req, res) => {
         ORDER BY loan_type, telco
       `;
 
-      const [rows] = await pool.execute(query, [parseInt(days)]);
+      const [rows] = await pool.query(query, [parseInt(days)]);
       
       const formattedSummaries = rows.map(row => ({
         ...row,
@@ -368,7 +451,7 @@ app.get('/api/npl-data', async (req, res) => {
         END
     `;
 
-    const [rows] = await pool.execute(query);
+    const [rows] = await pool.query(query);
     
     const nplData = rows.map(row => ({
       ...row,
@@ -411,8 +494,8 @@ app.get('/api/status', async (req, res) => {
       FROM MTN_loan_data
     `;
 
-    const [airtelResult] = await pool.execute(airtelQuery);
-    const [mtnResult] = await pool.execute(mtnQuery);
+    const [airtelResult] = await pool.query(airtelQuery);
+    const [mtnResult] = await pool.query(mtnQuery);
 
     res.json({
       status: 'active',
@@ -432,6 +515,60 @@ app.get('/api/status', async (req, res) => {
   } catch (error) {
     console.error('Status query failed:', error);
     res.status(500).json({ error: 'Status query failed', details: error.message });
+  }
+});
+
+// Test endpoint to check table structure
+app.get('/api/test-table-structure', async (req, res) => {
+  try {
+    const [rows] = await pool.query('DESCRIBE airtel_loan_data');
+    res.json({ columns: rows });
+  } catch (error) {
+    console.error('Table structure check failed:', error);
+    res.status(500).json({ error: 'Table structure check failed', details: error.message });
+  }
+});
+
+// Test endpoint with simple query
+app.get('/api/test-simple-query', async (req, res) => {
+  try {
+    const query = `SELECT load_date, loan_type, denom, gross_lent FROM airtel_loan_data LIMIT 10`;
+    console.log('🔍 Simple Test Query:', query);
+    const [rows] = await pool.query(query);
+    res.json({ data: rows, count: rows.length });
+  } catch (error) {
+    console.error('Simple query failed:', error);
+    res.status(500).json({ error: 'Simple query failed', details: error.message });
+  }
+});
+
+// Test what the actual API returns for Aug 6
+app.get('/api/test-api-output', async (req, res) => {
+  try {
+    // Simulate the actual API call for Aug 6
+    const apiUrl = `http://localhost:${process.env.PORT || 5000}/api/loan-data?start_date=2025-08-06&end_date=2025-08-06&telco=airtel`;
+    console.log('🔍 Testing API URL:', apiUrl);
+    
+    // Make internal API call
+    const fetch = require('node-fetch');
+    const response = await fetch(apiUrl);
+    const data = await response.json();
+    
+    // Calculate totals from API response
+    const apiTotals = {
+      record_count: data.data?.length || 0,
+      total_lending_txns: data.data?.reduce((sum, row) => sum + (parseFloat(row.lending_txns) || 0), 0) || 0,
+      total_gross_lent: data.data?.reduce((sum, row) => sum + (parseFloat(row.gross_lent) || 0), 0) || 0,
+      total_sfee_lent: data.data?.reduce((sum, row) => sum + (parseFloat(row.sfee_lent) || 0), 0) || 0
+    };
+    
+    res.json({
+      api_response: data,
+      calculated_totals: apiTotals
+    });
+  } catch (error) {
+    console.error('API test failed:', error);
+    res.status(500).json({ error: 'API test failed', details: error.message });
   }
 });
 
