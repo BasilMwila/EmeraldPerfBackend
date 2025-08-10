@@ -10,7 +10,7 @@ const cors = require('cors');
 const moment = require('moment');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 
 // Middleware
 app.use(cors());
@@ -429,19 +429,38 @@ app.get('/api/loan-data/summary', async (req, res) => {
 // Get NPL data
 app.get('/api/npl-data', async (req, res) => {
   try {
+    console.log('=== NPL DEBUG: Complete NPL query with JOIN ===');
+    
+    // Complete query with JOIN to get both outstanding and recovered data
+    // Use latest available date for unrecovered table since it might be one day behind
     const query = `
       SELECT 
-        loan_type,
-        total_balance,
-        within_tenure,
-        arrears_30_days,
-        arrears_181_plus_days,
-        ROUND(((total_balance - within_tenure) / total_balance * 100), 2) as arrears_percentage,
-        report_date
-      FROM airtel_npl_outstanding_balance_net_summary 
-      WHERE report_date = (SELECT MAX(report_date) FROM airtel_npl_outstanding_balance_net_summary)
+        o.loan_type,
+        o.total_balance,
+        o.within_tenure,
+        o.arrears_30_days,
+        o.arrears_31_60_days,
+        o.arrears_61_90_days,
+        o.arrears_91_120_days,
+        o.arrears_121_150_days,
+        o.arrears_151_180_days,
+        o.arrears_181_plus_days,
+        ROUND(((o.total_balance - o.within_tenure) / o.total_balance * 100), 2) as arrears_percentage,
+        o.report_date,
+        COALESCE(r.total_balance, 0) as net_recovered_value,
+        COALESCE(u.total_balance, 
+          ROUND(((o.total_balance) / (o.total_balance + COALESCE(r.total_balance, 0)) * 100), 2)
+        ) as unrecovered_percentage_net
+      FROM airtel_npl_outstanding_balance_net_summary o
+      LEFT JOIN airtel_npl_net_recovered_value_summary r 
+        ON o.loan_type = r.loan_type 
+        AND DATE(o.report_date) = DATE(r.report_date)
+      LEFT JOIN airtel_npl_unrecovered_percentage_summary u 
+        ON o.loan_type = u.loan_type 
+        AND DATE(u.report_date) = (SELECT MAX(DATE(report_date)) FROM airtel_npl_unrecovered_percentage_summary WHERE loan_type = o.loan_type)
+      WHERE o.report_date = (SELECT MAX(report_date) FROM airtel_npl_outstanding_balance_net_summary)
       ORDER BY 
-        CASE loan_type
+        CASE o.loan_type
           WHEN '7 Days Loan' THEN 1
           WHEN '14 Days Loan' THEN 2
           WHEN '21 Days Loan' THEN 3
@@ -450,16 +469,37 @@ app.get('/api/npl-data', async (req, res) => {
           ELSE 6
         END
     `;
+    
+    console.log('NPL Query:', query);
 
     const [rows] = await pool.query(query);
+    
+    console.log('=== NPL DEBUG: JOIN Results ===');
+    rows.forEach(row => {
+      console.log(`${row.loan_type}:`);
+      console.log(`  Total Balance: ${row.total_balance}`);
+      console.log(`  Net Recovered: ${row.net_recovered_value}`);
+      console.log(`  Unrecovered %: ${row.unrecovered_percentage_net}`);
+      console.log(`  All arrears fields present: ${!!(row.arrears_31_60_days && row.arrears_61_90_days && row.arrears_91_120_days)}`);
+    });
     
     const nplData = rows.map(row => ({
       ...row,
       report_date: moment(row.report_date).format('YYYY-MM-DD'),
+      // Use direct field mapping from database
       total_balance: parseFloat(row.total_balance) || 0,
       within_tenure: parseFloat(row.within_tenure) || 0,
       arrears_30_days: parseFloat(row.arrears_30_days) || 0,
+      arrears_31_60_days: parseFloat(row.arrears_31_60_days) || 0,
+      arrears_61_90_days: parseFloat(row.arrears_61_90_days) || 0,
+      arrears_91_120_days: parseFloat(row.arrears_91_120_days) || 0,
+      arrears_121_150_days: parseFloat(row.arrears_121_150_days) || 0,
+      arrears_151_180_days: parseFloat(row.arrears_151_180_days) || 0,
       arrears_181_plus_days: parseFloat(row.arrears_181_plus_days) || 0,
+      // Recovered and percentage data from JOINed tables
+      net_recovered_value: parseFloat(row.net_recovered_value) || 0,
+      unrecovered_percentage_net: parseFloat(row.unrecovered_percentage_net) || 0,
+      // Calculated percentages
       arrears_percentage: parseFloat(row.arrears_percentage) || 0
     }));
 
@@ -539,6 +579,49 @@ app.get('/api/test-simple-query', async (req, res) => {
   } catch (error) {
     console.error('Simple query failed:', error);
     res.status(500).json({ error: 'Simple query failed', details: error.message });
+  }
+});
+
+// Test NPL table structures and date ranges
+app.get('/api/test-npl-tables', async (req, res) => {
+  try {
+    const results = {};
+    
+    // Test airtel_npl_outstanding_balance_net_summary
+    const query1 = `SELECT * FROM airtel_npl_outstanding_balance_net_summary LIMIT 1`;
+    console.log('🔍 Testing outstanding table:', query1);
+    const [rows1] = await pool.query(query1);
+    results.outstanding_table = { columns: Object.keys(rows1[0] || {}), sample_data: rows1[0] };
+    
+    // Test airtel_npl_net_recovered_value_summary
+    const query2 = `SELECT * FROM airtel_npl_net_recovered_value_summary LIMIT 1`;
+    console.log('🔍 Testing recovered table:', query2);
+    const [rows2] = await pool.query(query2);
+    results.recovered_table = { columns: Object.keys(rows2[0] || {}), sample_data: rows2[0] };
+    
+    // Test airtel_npl_unrecovered_percentage_summary
+    const query3 = `SELECT * FROM airtel_npl_unrecovered_percentage_summary LIMIT 1`;
+    console.log('🔍 Testing unrecovered table:', query3);
+    const [rows3] = await pool.query(query3);
+    results.unrecovered_table = { columns: Object.keys(rows3[0] || {}), sample_data: rows3[0] };
+    
+    // Check available dates in all tables
+    const dateQuery1 = `SELECT DISTINCT DATE(report_date) as date FROM airtel_npl_outstanding_balance_net_summary ORDER BY date DESC LIMIT 5`;
+    const [datRows1] = await pool.query(dateQuery1);
+    results.outstanding_dates = datRows1;
+    
+    const dateQuery2 = `SELECT DISTINCT DATE(report_date) as date FROM airtel_npl_net_recovered_value_summary ORDER BY date DESC LIMIT 5`;
+    const [datRows2] = await pool.query(dateQuery2);
+    results.recovered_dates = datRows2;
+    
+    const dateQuery3 = `SELECT DISTINCT DATE(report_date) as date FROM airtel_npl_unrecovered_percentage_summary ORDER BY date DESC LIMIT 5`;
+    const [datRows3] = await pool.query(dateQuery3);
+    results.unrecovered_dates = datRows3;
+    
+    res.json(results);
+  } catch (error) {
+    console.error('NPL table test failed:', error);
+    res.status(500).json({ error: 'NPL table test failed', details: error.message });
   }
 });
 
